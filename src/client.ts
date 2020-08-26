@@ -3,9 +3,9 @@ const _global = typeof global !== 'undefined' ? global : (typeof window !== 'und
 const NativeWebSocket = _global.WebSocket || _global.MozWebSocket;
 
 import * as Backoff from 'backo2';
-import { EventEmitter, ListenerFn } from 'eventemitter3';
-import isString = require('lodash.isstring');
-import isObject = require('lodash.isobject');
+import { default as EventEmitterType, EventEmitter, ListenerFn } from 'eventemitter3';
+import isString from './utils/is-string';
+import isObject from './utils/is-object';
 import { ExecutionResult } from 'graphql/execution/execute';
 import { print } from 'graphql/language/printer';
 import { DocumentNode } from 'graphql/language/ast';
@@ -13,7 +13,7 @@ import { getOperationAST } from 'graphql/utilities/getOperationAST';
 import $$observable from 'symbol-observable';
 
 import { GRAPHQL_WS } from './protocol';
-import { WS_TIMEOUT } from './defaults';
+import { MIN_WS_TIMEOUT, WS_TIMEOUT } from './defaults';
 import MessageTypes from './message-types';
 
 export interface Observer<T> {
@@ -56,16 +56,18 @@ export type ConnectionParams = {
   [paramName: string]: any,
 };
 
-export type ConnectionParamsOptions = ConnectionParams | Function;
+export type ConnectionParamsOptions = ConnectionParams | Function | Promise<ConnectionParams>;
 
 export interface ClientOptions {
   connectionParams?: ConnectionParamsOptions;
+  minTimeout?: number;
   timeout?: number;
   reconnect?: boolean;
   reconnectionAttempts?: number;
   connectionCallback?: (error: Error[], result?: any) => void;
   lazy?: boolean;
   inactivityTimeout?: number;
+  wsOptionArguments?: any[];
 }
 
 export class SubscriptionClient {
@@ -73,7 +75,8 @@ export class SubscriptionClient {
   public operations: Operations;
   private url: string;
   private nextOperationId: number;
-  private connectionParams: ConnectionParamsOptions;
+  private connectionParams: Function;
+  private minWsTimeout: number;
   private wsTimeout: number;
   private unsentMessagesQueue: Array<any>; // queued messages while websocket is opening.
   private reconnect: boolean;
@@ -81,41 +84,50 @@ export class SubscriptionClient {
   private reconnectionAttempts: number;
   private backoff: any;
   private connectionCallback: any;
-  private eventEmitter: EventEmitter;
+  private eventEmitter: EventEmitterType;
   private lazy: boolean;
   private inactivityTimeout: number;
   private inactivityTimeoutId: any;
   private closedByUser: boolean;
   private wsImpl: any;
+  private wsProtocols: string | string[];
   private wasKeepAliveReceived: boolean;
   private tryReconnectTimeoutId: any;
   private checkConnectionIntervalId: any;
   private maxConnectTimeoutId: any;
   private middlewares: Middleware[];
   private maxConnectTimeGenerator: any;
+  private wsOptionArguments: any[];
 
-  constructor(url: string, options?: ClientOptions, webSocketImpl?: any) {
+  constructor(
+    url: string,
+    options?: ClientOptions,
+    webSocketImpl?: any,
+    webSocketProtocols?: string | string[],
+  ) {
     const {
       connectionCallback = undefined,
       connectionParams = {},
+      minTimeout = MIN_WS_TIMEOUT,
       timeout = WS_TIMEOUT,
       reconnect = false,
       reconnectionAttempts = Infinity,
       lazy = false,
       inactivityTimeout = 0,
+      wsOptionArguments = [],
     } = (options || {});
 
     this.wsImpl = webSocketImpl || NativeWebSocket;
-
     if (!this.wsImpl) {
       throw new Error('Unable to find native implementation, or alternative implementation for WebSocket!');
     }
 
-    this.connectionParams = connectionParams;
+    this.wsProtocols = webSocketProtocols || GRAPHQL_WS;
     this.connectionCallback = connectionCallback;
     this.url = url;
     this.operations = {};
     this.nextOperationId = 0;
+    this.minWsTimeout = minTimeout;
     this.wsTimeout = timeout;
     this.unsentMessagesQueue = [];
     this.reconnect = reconnect;
@@ -129,6 +141,8 @@ export class SubscriptionClient {
     this.middlewares = [];
     this.client = null;
     this.maxConnectTimeGenerator = this.createMaxConnectTimeGenerator();
+    this.connectionParams = this.getConnectionParams(connectionParams);
+    this.wsOptionArguments = wsOptionArguments;
 
     if (!this.lazy) {
       this.connect();
@@ -157,6 +171,10 @@ export class SubscriptionClient {
       }
 
       this.client.close();
+      this.client.onopen = null;
+      this.client.onclose = null;
+      this.client.onerror = null;
+      this.client.onmessage = null;
       this.client = null;
       this.eventEmitter.emit('disconnected');
 
@@ -288,6 +306,20 @@ export class SubscriptionClient {
     return this;
   }
 
+  private getConnectionParams(connectionParams: ConnectionParamsOptions): Function {
+    return (): Promise<ConnectionParams> => new Promise((resolve, reject) => {
+      if (typeof connectionParams === 'function') {
+        try {
+          return resolve(connectionParams.call(null));
+        } catch (error) {
+          return reject(error);
+        }
+      }
+
+      resolve(connectionParams);
+    });
+  }
+
   private executeOperation(options: OperationOptions, handler: (error: Error[], result?: any) => void): string {
     if (this.client === null) {
       this.connect();
@@ -329,7 +361,7 @@ export class SubscriptionClient {
   }
 
   private createMaxConnectTimeGenerator() {
-    const minValue = 1000;
+    const minValue = this.minWsTimeout;
     const maxValue = this.wsTimeout;
 
     return new Backoff({
@@ -448,7 +480,7 @@ export class SubscriptionClient {
         try {
           JSON.parse(serializedMessage);
         } catch (e) {
-          throw new Error(`Message must be JSON-serializable. Got: ${message}`);
+          this.eventEmitter.emit('error', new Error(`Message must be JSON-serializable. Got: ${message}`));
         }
 
         this.client.send(serializedMessage);
@@ -459,8 +491,8 @@ export class SubscriptionClient {
         break;
       default:
         if (!this.reconnecting) {
-          throw new Error('A message was not sent because socket is not connected, is closing or ' +
-            'is already closed. Message was: ' + JSON.stringify(message));
+          this.eventEmitter.emit('error', new Error('A message was not sent because socket is not connected, is closing or ' +
+            'is already closed. Message was: ' + JSON.stringify(message)));
         }
     }
   }
@@ -515,30 +547,38 @@ export class SubscriptionClient {
     // Max timeout trying to connect
     this.maxConnectTimeoutId = setTimeout(() => {
       if (this.status !== this.wsImpl.OPEN) {
+        this.reconnecting = true;
         this.close(false, true);
       }
     }, this.maxConnectTimeGenerator.duration());
   }
 
   private connect() {
-    this.client = new this.wsImpl(this.url, GRAPHQL_WS);
+    this.client = new this.wsImpl(this.url, this.wsProtocols, ...this.wsOptionArguments);
 
     this.checkMaxConnectTimeout();
 
-    this.client.onopen = () => {
-      this.clearMaxConnectTimeout();
-      this.closedByUser = false;
-      this.eventEmitter.emit(this.reconnecting ? 'reconnecting' : 'connecting');
+    this.client.onopen = async () => {
+      if (this.status === this.wsImpl.OPEN) {
+        this.clearMaxConnectTimeout();
+        this.closedByUser = false;
+        this.eventEmitter.emit(this.reconnecting ? 'reconnecting' : 'connecting');
 
-      const payload: ConnectionParams = typeof this.connectionParams === 'function' ? this.connectionParams() : this.connectionParams;
+        try {
+          const connectionParams: ConnectionParams = await this.connectionParams();
 
-      // Send CONNECTION_INIT message, no need to wait for connection to success (reduce roundtrips)
-      this.sendMessage(undefined, MessageTypes.GQL_CONNECTION_INIT, payload);
-      this.flushUnsentMessagesQueue();
+          // Send CONNECTION_INIT message, no need to wait for connection to success (reduce roundtrips)
+          this.sendMessage(undefined, MessageTypes.GQL_CONNECTION_INIT, connectionParams);
+          this.flushUnsentMessagesQueue();
+        } catch (error) {
+          this.sendMessage(undefined, MessageTypes.GQL_CONNECTION_ERROR, error);
+          this.flushUnsentMessagesQueue();
+        }
+      }
     };
 
     this.client.onclose = () => {
-      if ( !this.closedByUser ) {
+      if (!this.closedByUser) {
         this.close(false, false);
       }
     };
@@ -584,7 +624,7 @@ export class SubscriptionClient {
         break;
 
       case MessageTypes.GQL_CONNECTION_ACK:
-        this.eventEmitter.emit(this.reconnecting ? 'reconnected' : 'connected');
+        this.eventEmitter.emit(this.reconnecting ? 'reconnected' : 'connected', parsedMessage.payload);
         this.reconnecting = false;
         this.backoff.reset();
         this.maxConnectTimeGenerator.reset();
@@ -595,8 +635,9 @@ export class SubscriptionClient {
         break;
 
       case MessageTypes.GQL_COMPLETE:
-        this.operations[opId].handler(null, null);
+        const handler = this.operations[opId].handler;
         delete this.operations[opId];
+        handler.call(this, null, null);
         break;
 
       case MessageTypes.GQL_ERROR:
