@@ -1,5 +1,5 @@
 {
-  "name": "subscriptions-transport-ws",
+  "name": "wighawag-subscriptions-transport-ws",
   "version": "0.9.15",
   "description": "A websocket transport for GraphQL subscriptions",
   "main": "dist/index.js",
